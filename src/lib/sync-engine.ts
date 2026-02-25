@@ -64,9 +64,18 @@ export async function runFullSync(sourceFilter?: "notion" | "turso"): Promise<{
     const existingHash = existing.rows[0]?.content_hash as string | undefined;
 
     if (existingHash === doc.content_hash) {
-      // Content unchanged - skip re-embedding
-      chunksSkipped++;
-      continue;
+      // Check if chunks exist for this document (may have been stored but not embedded)
+      const chunkCheck = await db.execute({
+        sql: "SELECT COUNT(*) as count FROM chunks WHERE document_id = ? AND document_source = ? AND embedding IS NOT NULL",
+        args: [doc.id, doc.source],
+      });
+      const hasEmbeddedChunks = (chunkCheck.rows[0]?.count as number) > 0;
+
+      if (hasEmbeddedChunks) {
+        chunksSkipped++;
+        continue;
+      }
+      // Document exists but has no embedded chunks — needs re-processing
     }
 
     // Upsert document
