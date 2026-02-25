@@ -1,4 +1,5 @@
 // src/lib/retry.ts — Retry, rate limiting, and request auth utilities
+import { timingSafeEqual } from "crypto";
 import {
   DEFAULT_MAX_RETRY_ATTEMPTS,
   DEFAULT_RETRY_BASE_DELAY_MS,
@@ -87,7 +88,13 @@ export function verifyCronSecret(authHeader: string | null): boolean {
     // Dev mode: allow without secret
     return true;
   }
-  return authHeader === `Bearer ${secret}`;
+  const expected = `Bearer ${secret}`;
+  if (!authHeader) return false;
+  try {
+    return timingSafeEqual(Buffer.from(authHeader), Buffer.from(expected));
+  } catch {
+    return false;
+  }
 }
 
 /**
