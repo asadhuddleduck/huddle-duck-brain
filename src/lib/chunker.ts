@@ -1,5 +1,6 @@
 // src/lib/chunker.ts
-import { createHash } from "crypto";
+import { hashContent } from "./hash";
+import { MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, CHUNK_OVERLAP } from "./constants";
 
 export interface TextChunk {
   content: string;
@@ -7,10 +8,6 @@ export interface TextChunk {
   heading: string | null;
   metadata: { charStart: number; charEnd: number };
 }
-
-const MAX_CHUNK_SIZE = 1000;  // ~250 tokens (conservative for voyage-4)
-const MIN_CHUNK_SIZE = 100;
-const OVERLAP = 100;          // Character overlap between chunks
 
 export function chunkDocument(text: string, title: string): TextChunk[] {
   if (!text.trim()) return [];
@@ -144,8 +141,8 @@ function splitByParagraphs(
       });
 
       // Start new chunk with overlap from end of current
-      const overlapText = currentChunk.slice(-OVERLAP);
-      chunkStart += currentChunk.length - OVERLAP;
+      const overlapText = currentChunk.slice(-CHUNK_OVERLAP);
+      chunkStart += currentChunk.length - CHUNK_OVERLAP;
       currentChunk = overlapText;
     }
     currentChunk += (currentChunk ? "\n\n" : "") + para;
@@ -181,13 +178,12 @@ function forceSplit(text: string, title: string): TextChunk[] {
       metadata: { charStart: i, charEnd: end },
     });
 
-    i = end - OVERLAP;
+    i = end - CHUNK_OVERLAP;
     if (i >= text.length) break;
   }
 
   return chunks;
 }
 
-export function hashChunk(content: string): string {
-  return createHash("sha256").update(content).digest("hex");
-}
+/** @deprecated Use hashContent from ./hash directly. Kept for backward compatibility. */
+export const hashChunk = hashContent;

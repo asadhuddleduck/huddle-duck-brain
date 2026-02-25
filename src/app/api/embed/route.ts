@@ -1,5 +1,5 @@
 import { embedPending } from "@/lib/sync-engine";
-import { verifyCronSecret } from "@/lib/retry";
+import { verifyCronSecret, sanitizeErrorMessage } from "@/lib/retry";
 
 export const maxDuration = 300; // 5 minutes
 
@@ -16,9 +16,12 @@ export async function GET(req: Request) {
       ...result,
       timestamp: new Date().toISOString(),
     });
-  } catch (error: any) {
+  } catch (error: unknown) {
     console.error("Embed error:", error);
-    return Response.json({ error: error.message }, { status: 500 });
+    return Response.json(
+      { error: sanitizeErrorMessage(error) },
+      { status: 500 }
+    );
   }
 }
 

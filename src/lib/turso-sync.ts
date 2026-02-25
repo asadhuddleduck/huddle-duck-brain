@@ -1,11 +1,7 @@
 // src/lib/turso-sync.ts
 import { createClient, type Client } from "@libsql/client";
-import { createHash } from "crypto";
+import { hashContent } from "./hash";
 import type { Document } from "./types";
-
-function hashContent(text: string): string {
-  return createHash("sha256").update(text).digest("hex");
-}
 
 interface TursoSource {
   name: string;
@@ -118,13 +114,13 @@ function connectToSource(source: TursoSource): Client | null {
   const url = process.env[source.urlEnv]?.trim();
   const token = process.env[source.tokenEnv]?.trim();
   if (!url || !token) {
-    console.warn(`Skipping ${source.name}: missing env vars`);
+    console.warn(`[turso-sync] Skipping ${source.name}: missing env vars`);
     return null;
   }
   return createClient({ url, authToken: token });
 }
 
-function rowToContent(row: Record<string, any>, contentColumns: string[]): string {
+function rowToContent(row: Record<string, unknown>, contentColumns: string[]): string {
   return contentColumns
     .map((col) => {
       const val = row[col];
@@ -147,12 +143,16 @@ export async function crawlTursoDatabases(): Promise<Document[]> {
         const result = await client.execute({ sql: query.sql, args: [] });
 
         for (const row of result.rows) {
-          const rowObj = row as unknown as Record<string, any>;
+          const rowObj = row as unknown as Record<string, unknown>;
           const title = String(rowObj[query.titleColumn] || "Untitled");
           const content = `# ${title}\nSource: ${source.name} / ${query.label}\n\n${rowToContent(rowObj, query.contentColumns)}`;
           const id = rowObj.id
             ? String(rowObj.id)
             : `${query.label}_${hashContent(content).slice(0, 12)}`;
+
+          const lastEdited = (rowObj.synced_at as string | null)
+            ?? (rowObj.created_at as string | null)
+            ?? null;
 
           documents.push({
             id,
@@ -163,17 +163,17 @@ export async function crawlTursoDatabases(): Promise<Document[]> {
             content,
             content_hash: hashContent(content),
             metadata: JSON.stringify({ table: query.label, raw: rowObj }),
-            last_edited: rowObj.synced_at || rowObj.created_at || null,
+            last_edited: lastEdited,
             synced_at: new Date().toISOString(),
           });
         }
       }
-      console.log(`${source.name}: extracted documents`);
+      console.log(`[turso-sync] ${source.name}: extracted documents`);
     } catch (error) {
-      console.error(`Failed to sync ${source.name}:`, error);
+      console.error(`[turso-sync] Failed to sync ${source.name}:`, error);
     }
   }
 
-  console.log(`Turso sync complete: ${documents.length} documents`);
+  console.log(`[turso-sync] Complete: ${documents.length} documents`);
   return documents;
 }

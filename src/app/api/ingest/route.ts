@@ -1,12 +1,12 @@
 import { runFullSync } from "@/lib/sync-engine";
+import { verifyCronSecret, sanitizeErrorMessage } from "@/lib/retry";
 
 export const maxDuration = 300;
 
 export async function POST(req: Request) {
-  // Simple bearer token auth
+  // Auth: use the same verifyCronSecret as other protected endpoints
   const authHeader = req.headers.get("authorization");
-  const token = process.env.CRON_SECRET;
-  if (token && authHeader !== `Bearer ${token}`) {
+  if (!verifyCronSecret(authHeader)) {
     return Response.json({ error: "Unauthorized" }, { status: 401 });
   }
 
@@ -22,9 +22,16 @@ export async function POST(req: Request) {
     return Response.json({
       success: true,
       ...result,
+      message: result.partial
+        ? "Partial sync completed (time budget exceeded). Call again to continue."
+        : "Sync complete.",
       timestamp: new Date().toISOString(),
     });
-  } catch (error: any) {
-    return Response.json({ error: error.message }, { status: 500 });
+  } catch (error: unknown) {
+    console.error("Ingest error:", error);
+    return Response.json(
+      { error: sanitizeErrorMessage(error) },
+      { status: 500 }
+    );
   }
 }

@@ -1,11 +1,34 @@
 // src/lib/notion-crawler.ts
 import { Client } from "@notionhq/client";
-import { createHash } from "crypto";
 import { RateLimiter } from "./retry";
+import { hashContent } from "./hash";
+import { NOTION_RATE_LIMIT, NOTION_MAX_BLOCK_DEPTH } from "./constants";
 import type { Document } from "./types";
 
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
-const limiter = new RateLimiter(3); // Notion: 3 req/s
+const limiter = new RateLimiter(NOTION_RATE_LIMIT);
+
+// Time budget: stop crawling at 240s to leave 60s for DB writes (300s Vercel limit)
+const DEFAULT_TIME_BUDGET_MS = 240_000;
+
+export interface CrawlOptions {
+  /** ISO timestamp — only crawl pages edited after this time */
+  since?: string;
+  /** Max milliseconds to spend crawling (default 240s) */
+  timeBudgetMs?: number;
+}
+
+export interface CrawlResult {
+  documents: Document[];
+  /** true if we stopped early due to time budget */
+  partial: boolean;
+  /** Total pages/databases discovered (before filtering) */
+  totalDiscovered: number;
+  /** Number of items we actually processed */
+  totalProcessed: number;
+  /** Number of items skipped (not edited since `since`) */
+  totalSkipped: number;
+}
 
 // --- Rich text extraction ---
 
@@ -78,14 +101,12 @@ function blockToText(block: any, depth: number = 0): string {
 
 // --- Recursive block extraction ---
 
-const MAX_DEPTH = 10;
-
 async function extractBlockChildren(
   blockId: string,
   lines: string[],
   depth: number
 ): Promise<void> {
-  if (depth > MAX_DEPTH) return;
+  if (depth > NOTION_MAX_BLOCK_DEPTH) return;
 
   let cursor: string | undefined;
   do {
@@ -164,21 +185,63 @@ function extractTitle(properties: Record<string, any>): string {
   return "Untitled";
 }
 
-// --- Content hashing ---
+// --- Time budget helper ---
 
-export function hashContent(text: string): string {
-  return createHash("sha256").update(text).digest("hex");
+class TimeBudget {
+  private startTime: number;
+  private budgetMs: number;
+
+  constructor(budgetMs: number) {
+    this.startTime = Date.now();
+    this.budgetMs = budgetMs;
+  }
+
+  /** Returns true if we have exhausted the time budget */
+  expired(): boolean {
+    return Date.now() - this.startTime >= this.budgetMs;
+  }
+
+  /** Milliseconds elapsed so far */
+  elapsed(): number {
+    return Date.now() - this.startTime;
+  }
+
+  /** Milliseconds remaining */
+  remaining(): number {
+    return Math.max(0, this.budgetMs - this.elapsed());
+  }
 }
 
-// --- Main crawl functions ---
+// --- Main crawl function (incremental + time-budgeted) ---
 
-export async function crawlNotionWorkspace(): Promise<Document[]> {
+export async function crawlNotionWorkspace(
+  options: CrawlOptions = {}
+): Promise<CrawlResult> {
+  const { since, timeBudgetMs = DEFAULT_TIME_BUDGET_MS } = options;
+  const timer = new TimeBudget(timeBudgetMs);
   const documents: Document[] = [];
+  let totalDiscovered = 0;
+  let totalProcessed = 0;
+  let totalSkipped = 0;
+  let partial = false;
 
-  // 1. Discover all pages
+  console.log(
+    `Notion crawl starting${since ? ` (incremental, since ${since})` : " (full)"}` +
+    ` with ${timeBudgetMs / 1000}s time budget`
+  );
+
+  // 1. Discover all pages (sorted by last_edited_time desc)
+  //    The search API itself is fast (metadata only). The expensive part is
+  //    extractPageContent() below, so we discover everything first, then
+  //    filter by `since` before doing the expensive content extraction.
   const allPages: any[] = [];
   let cursor: string | undefined;
   do {
+    if (timer.expired()) {
+      console.log("Time budget expired during page discovery");
+      partial = true;
+      break;
+    }
     const response: any = await limiter.execute(() =>
       notion.search({
         filter: { property: "object", value: "page" },
@@ -189,37 +252,78 @@ export async function crawlNotionWorkspace(): Promise<Document[]> {
     );
     allPages.push(...response.results);
     cursor = response.has_more ? response.next_cursor : undefined;
+
+    // Optimization: if doing incremental sync and the search is sorted
+    // by last_edited desc, once we see a page older than `since`, all
+    // subsequent pages will also be older — we can stop paginating.
+    if (since && response.results.length > 0) {
+      const lastResult = response.results[response.results.length - 1];
+      if (lastResult.last_edited_time && lastResult.last_edited_time < since) {
+        // All remaining pages are older than `since`, stop fetching
+        break;
+      }
+    }
   } while (cursor);
 
   // 2. Discover all databases
   const allDatabases: any[] = [];
   cursor = undefined;
-  do {
-    const response: any = await limiter.execute(() =>
-      notion.search({
-        filter: { property: "object", value: "data_source" },
-        page_size: 100,
-        start_cursor: cursor,
-      })
-    );
-    allDatabases.push(...response.results);
-    cursor = response.has_more ? response.next_cursor : undefined;
-  } while (cursor);
+  if (!partial) {
+    do {
+      if (timer.expired()) {
+        console.log("Time budget expired during database discovery");
+        partial = true;
+        break;
+      }
+      const response: any = await limiter.execute(() =>
+        notion.search({
+          filter: { property: "object", value: "data_source" },
+          page_size: 100,
+          start_cursor: cursor,
+        })
+      );
+      allDatabases.push(...response.results);
+      cursor = response.has_more ? response.next_cursor : undefined;
+    } while (cursor);
+  }
 
   // 3. Separate standalone pages from database rows
   const standalonePages = allPages.filter(
     (p: any) => p.parent?.type !== "database_id"
   );
 
+  // Filter by `since` if doing incremental sync
+  const pagesToCrawl = since
+    ? standalonePages.filter((p: any) => !p.last_edited_time || p.last_edited_time >= since)
+    : standalonePages;
+
+  const pagesSkipped = standalonePages.length - pagesToCrawl.length;
+
+  const databasesToCrawl = since
+    ? allDatabases.filter((d: any) => !d.last_edited_time || d.last_edited_time >= since)
+    : allDatabases;
+
+  const dbsSkipped = allDatabases.length - databasesToCrawl.length;
+
+  totalDiscovered = standalonePages.length + allDatabases.length;
+  totalSkipped = pagesSkipped + dbsSkipped;
+
   console.log(
-    `Discovered: ${standalonePages.length} pages, ${allDatabases.length} databases`
+    `Discovered: ${standalonePages.length} pages (${pagesToCrawl.length} to crawl), ` +
+    `${allDatabases.length} databases (${databasesToCrawl.length} to crawl)`
   );
 
-  // 4. Extract standalone pages
-  for (const page of standalonePages) {
+  // 4. Extract standalone pages (time-budgeted)
+  for (const page of pagesToCrawl) {
+    if (timer.expired()) {
+      console.log(`Time budget expired after processing ${totalProcessed} pages (${timer.elapsed()}ms)`);
+      partial = true;
+      break;
+    }
+
     try {
       const content = await extractPageContent(page.id);
-      if (!content.trim()) continue; // Skip empty pages
+      if (!content.trim()) continue;
 
       const title = extractTitle(page.properties || {});
       documents.push({
@@ -234,110 +338,145 @@ export async function crawlNotionWorkspace(): Promise<Document[]> {
         last_edited: page.last_edited_time,
         synced_at: new Date().toISOString(),
       });
+      totalProcessed++;
     } catch (error) {
       console.error(`Failed to extract page ${page.id}:`, error);
     }
   }
 
-  // 5. Extract databases (schema + rows)
-  for (const database of allDatabases) {
-    try {
-      // Schema document
-      const dbDetail: any = await limiter.execute(() =>
-        notion.databases.retrieve({ database_id: database.id })
-      );
-      const dbTitle = richTextToPlain(dbDetail.title || []);
-      const schemaLines = Object.entries(dbDetail.properties || {}).map(
-        ([name, prop]: [string, any]) => {
-          let desc = `- ${name} (${prop.type})`;
-          if (prop.type === "select" && prop.select?.options) {
-            desc += `: ${prop.select.options.map((o: any) => o.name).join(", ")}`;
-          }
-          if (prop.type === "multi_select" && prop.multi_select?.options) {
-            desc += `: ${prop.multi_select.options.map((o: any) => o.name).join(", ")}`;
-          }
-          if (prop.type === "status" && prop.status?.options) {
-            desc += `: ${prop.status.options.map((o: any) => o.name).join(", ")}`;
-          }
-          return desc;
-        }
-      );
+  // 5. Extract databases (schema + rows) — time-budgeted
+  if (!partial) {
+    for (const database of databasesToCrawl) {
+      if (timer.expired()) {
+        console.log(`Time budget expired during database extraction (${timer.elapsed()}ms)`);
+        partial = true;
+        break;
+      }
 
-      const schemaContent = `# Database: ${dbTitle}\n\n## Properties\n${schemaLines.join("\n")}`;
-      documents.push({
-        id: database.id,
-        source: "notion",
-        source_url: database.url,
-        title: `Database Schema: ${dbTitle}`,
-        doc_type: "database_schema",
-        content: schemaContent,
-        content_hash: hashContent(schemaContent),
-        metadata: JSON.stringify({ type: "database_schema" }),
-        last_edited: database.last_edited_time,
-        synced_at: new Date().toISOString(),
-      });
-
-      // Database rows
-      let rowCursor: string | undefined;
-      do {
-        const rowResponse: any = await limiter.execute(() =>
-          notion.dataSources.query({
-            data_source_id: database.id,
-            page_size: 100,
-            start_cursor: rowCursor,
-          })
+      try {
+        // Schema document
+        const dbDetail: any = await limiter.execute(() =>
+          notion.databases.retrieve({ database_id: database.id })
+        );
+        const dbTitle = richTextToPlain(dbDetail.title || []);
+        const schemaLines = Object.entries(dbDetail.properties || {}).map(
+          ([name, prop]: [string, any]) => {
+            let desc = `- ${name} (${prop.type})`;
+            if (prop.type === "select" && prop.select?.options) {
+              desc += `: ${prop.select.options.map((o: any) => o.name).join(", ")}`;
+            }
+            if (prop.type === "multi_select" && prop.multi_select?.options) {
+              desc += `: ${prop.multi_select.options.map((o: any) => o.name).join(", ")}`;
+            }
+            if (prop.type === "status" && prop.status?.options) {
+              desc += `: ${prop.status.options.map((o: any) => o.name).join(", ")}`;
+            }
+            return desc;
+          }
         );
 
-        for (const row of rowResponse.results) {
-          try {
-            const properties = Object.fromEntries(
-              Object.entries(row.properties || {})
-                .map(([name, prop]: [string, any]) => [name, extractPropertyValue(prop)])
-                .filter(([_, v]) => (v as string).trim() !== "")
-            );
+        const schemaContent = `# Database: ${dbTitle}\n\n## Properties\n${schemaLines.join("\n")}`;
+        documents.push({
+          id: database.id,
+          source: "notion",
+          source_url: database.url,
+          title: `Database Schema: ${dbTitle}`,
+          doc_type: "database_schema",
+          content: schemaContent,
+          content_hash: hashContent(schemaContent),
+          metadata: JSON.stringify({ type: "database_schema" }),
+          last_edited: database.last_edited_time,
+          synced_at: new Date().toISOString(),
+        });
+        totalProcessed++;
 
-            const title = extractTitle(row.properties || {});
-            const bodyContent = await extractPageContent(row.id);
-
-            const propertiesText = Object.entries(properties)
-              .map(([k, v]) => `${k}: ${v}`)
-              .join("\n");
-
-            const fullContent = [
-              title ? `# ${title}` : "",
-              `Database: ${dbTitle}`,
-              propertiesText,
-              bodyContent,
-            ]
-              .filter(Boolean)
-              .join("\n\n");
-
-            if (!fullContent.trim()) continue;
-
-            documents.push({
-              id: row.id,
-              source: "notion",
-              source_url: row.url,
-              title: title || "Untitled",
-              doc_type: "database_row",
-              content: fullContent,
-              content_hash: hashContent(fullContent),
-              metadata: JSON.stringify({ database_id: database.id, database_title: dbTitle, properties }),
-              last_edited: row.last_edited_time,
-              synced_at: new Date().toISOString(),
-            });
-          } catch (error) {
-            console.error(`Failed to extract row ${row.id}:`, error);
+        // Database rows
+        let rowCursor: string | undefined;
+        do {
+          if (timer.expired()) {
+            console.log(`Time budget expired during database rows for ${dbTitle} (${timer.elapsed()}ms)`);
+            partial = true;
+            break;
           }
-        }
 
-        rowCursor = rowResponse.has_more ? rowResponse.next_cursor : undefined;
-      } while (rowCursor);
-    } catch (error) {
-      console.error(`Failed to extract database ${database.id}:`, error);
+          const rowResponse: any = await limiter.execute(() =>
+            notion.dataSources.query({
+              data_source_id: database.id,
+              page_size: 100,
+              start_cursor: rowCursor,
+            })
+          );
+
+          for (const row of rowResponse.results) {
+            if (timer.expired()) {
+              partial = true;
+              break;
+            }
+
+            // For incremental sync, skip rows not edited since `since`
+            if (since && row.last_edited_time && row.last_edited_time < since) {
+              totalSkipped++;
+              continue;
+            }
+
+            try {
+              const properties = Object.fromEntries(
+                Object.entries(row.properties || {})
+                  .map(([name, prop]: [string, any]) => [name, extractPropertyValue(prop)])
+                  .filter(([_, v]) => (v as string).trim() !== "")
+              );
+
+              const title = extractTitle(row.properties || {});
+              const bodyContent = await extractPageContent(row.id);
+
+              const propertiesText = Object.entries(properties)
+                .map(([k, v]) => `${k}: ${v}`)
+                .join("\n");
+
+              const fullContent = [
+                title ? `# ${title}` : "",
+                `Database: ${dbTitle}`,
+                propertiesText,
+                bodyContent,
+              ]
+                .filter(Boolean)
+                .join("\n\n");
+
+              if (!fullContent.trim()) continue;
+
+              documents.push({
+                id: row.id,
+                source: "notion",
+                source_url: row.url,
+                title: title || "Untitled",
+                doc_type: "database_row",
+                content: fullContent,
+                content_hash: hashContent(fullContent),
+                metadata: JSON.stringify({ database_id: database.id, database_title: dbTitle, properties }),
+                last_edited: row.last_edited_time,
+                synced_at: new Date().toISOString(),
+              });
+              totalProcessed++;
+            } catch (error) {
+              console.error(`Failed to extract row ${row.id}:`, error);
+            }
+          }
+
+          if (partial) break;
+          rowCursor = rowResponse.has_more ? rowResponse.next_cursor : undefined;
+        } while (rowCursor);
+
+        if (partial) break;
+      } catch (error) {
+        console.error(`Failed to extract database ${database.id}:`, error);
+      }
     }
   }
 
-  console.log(`Notion crawl complete: ${documents.length} documents`);
-  return documents;
+  console.log(
+    `Notion crawl ${partial ? "PARTIAL" : "complete"}: ${documents.length} documents extracted, ` +
+    `${totalProcessed} processed, ${totalSkipped} skipped (${timer.elapsed()}ms elapsed)`
+  );
+
+  return { documents, partial, totalDiscovered, totalProcessed, totalSkipped };
 }

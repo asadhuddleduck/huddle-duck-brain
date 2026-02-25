@@ -1,14 +1,36 @@
 // src/lib/embeddings.ts
 import { withRetry } from "./retry";
-
-const VOYAGE_API_URL = "https://api.voyageai.com/v1/embeddings";
-const MODEL = "voyage-4";
-const BATCH_SIZE = 100; // Voyage supports up to 1000, but keep batches manageable
-const DIMENSIONS = 1024;
+import {
+  VOYAGE_API_URL,
+  VOYAGE_MODEL,
+  VOYAGE_BATCH_SIZE,
+  EMBEDDING_DIMENSIONS,
+} from "./constants";
 
 interface VoyageResponse {
   data: Array<{ embedding: number[]; index: number }>;
   usage: { total_tokens: number };
+}
+
+interface VoyageApiError extends Error {
+  status: number;
+  headers: Record<string, string>;
+}
+
+/**
+ * Custom error class for embedding failures.
+ * Allows callers (e.g. query-engine) to detect embedding service issues
+ * and fall back to keyword search.
+ */
+export class EmbeddingServiceError extends Error {
+  public readonly isServiceError = true;
+  public readonly status?: number;
+
+  constructor(message: string, status?: number) {
+    super(message);
+    this.name = "EmbeddingServiceError";
+    this.status = status;
+  }
 }
 
 export async function generateEmbeddings(
@@ -16,14 +38,14 @@ export async function generateEmbeddings(
   inputType: "document" | "query" = "document"
 ): Promise<number[][]> {
   const apiKey = process.env.VOYAGE_API_KEY?.trim();
-  if (!apiKey) throw new Error("VOYAGE_API_KEY is not set");
+  if (!apiKey) throw new EmbeddingServiceError("VOYAGE_API_KEY is not set");
 
   const allEmbeddings: number[][] = new Array(texts.length);
   let totalTokens = 0;
 
   // Process in batches
-  for (let i = 0; i < texts.length; i += BATCH_SIZE) {
-    const batch = texts.slice(i, i + BATCH_SIZE);
+  for (let i = 0; i < texts.length; i += VOYAGE_BATCH_SIZE) {
+    const batch = texts.slice(i, i + VOYAGE_BATCH_SIZE);
 
     const response = await withRetry(async () => {
       const res = await fetch(VOYAGE_API_URL, {
@@ -34,15 +56,17 @@ export async function generateEmbeddings(
         },
         body: JSON.stringify({
           input: batch,
-          model: MODEL,
+          model: VOYAGE_MODEL,
           input_type: inputType,
-          output_dimension: DIMENSIONS,
+          output_dimension: EMBEDDING_DIMENSIONS,
         }),
       });
 
       if (!res.ok) {
-        const error: any = new Error(`Voyage API error: ${res.status}`);
-        error.status = res.status;
+        const error = new EmbeddingServiceError(
+          `Voyage API error: ${res.status}`,
+          res.status
+        ) as EmbeddingServiceError & VoyageApiError;
         error.headers = Object.fromEntries(res.headers.entries());
         throw error;
       }
@@ -57,7 +81,7 @@ export async function generateEmbeddings(
     totalTokens += response.usage.total_tokens;
   }
 
-  console.log(`Generated ${texts.length} embeddings (${totalTokens} tokens used)`);
+  console.log(`[embeddings] Generated ${texts.length} embeddings (${totalTokens} tokens)`);
   return allEmbeddings;
 }
 
@@ -66,9 +90,9 @@ export async function generateQueryEmbedding(query: string): Promise<number[]> {
   return embeddings[0];
 }
 
-// Convert embedding array to Turso vector format string
+/** Convert embedding array to Turso vector format string */
 export function embeddingToVector(embedding: number[]): string {
   return `[${embedding.join(",")}]`;
 }
 
-export { DIMENSIONS };
+export { EMBEDDING_DIMENSIONS };

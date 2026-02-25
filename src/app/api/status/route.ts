@@ -1,15 +1,24 @@
 import { getDb, initSchema } from "@/lib/db";
+import { verifyApiAuth, sanitizeErrorMessage } from "@/lib/retry";
 
-export async function GET() {
+export async function GET(req: Request) {
+  // Auth: require bearer token (status reveals infrastructure details)
+  if (!verifyApiAuth(req)) {
+    return Response.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
   try {
     await initSchema();
     const db = getDb();
 
     const [syncStatus, docCount, chunkCount] = await Promise.all([
-      db.execute({ sql: "SELECT * FROM sync_status ORDER BY last_sync DESC", args: [] }),
+      db.execute({ sql: "SELECT source, last_sync, last_sync_successful, documents_synced, chunks_created FROM sync_status ORDER BY last_sync DESC", args: [] }),
       db.execute({ sql: "SELECT source, doc_type, COUNT(*) as count FROM documents GROUP BY source, doc_type", args: [] }),
       db.execute({ sql: "SELECT COUNT(*) as count FROM chunks WHERE embedding IS NOT NULL", args: [] }),
     ]);
+
+    // Note: error_message is intentionally excluded from the response
+    // to avoid leaking internal error details. Check server logs instead.
 
     return Response.json({
       sync_status: syncStatus.rows,
@@ -17,7 +26,11 @@ export async function GET() {
       total_embedded_chunks: chunkCount.rows[0]?.count || 0,
       timestamp: new Date().toISOString(),
     });
-  } catch (error: any) {
-    return Response.json({ error: error.message }, { status: 500 });
+  } catch (error: unknown) {
+    console.error("Status error:", error);
+    return Response.json(
+      { error: sanitizeErrorMessage(error) },
+      { status: 500 }
+    );
   }
 }
