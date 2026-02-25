@@ -5,10 +5,14 @@ import { chunkDocument, hashChunk } from "./chunker";
 import { generateEmbeddings, embeddingToVector } from "./embeddings";
 import type { Document } from "./types";
 
+// Max documents to chunk+embed per invocation (avoids 300s timeout)
+const MAX_DOCS_PER_BATCH = 200;
+
 export async function runFullSync(sourceFilter?: "notion" | "turso"): Promise<{
   documentsProcessed: number;
   chunksCreated: number;
   chunksSkipped: number;
+  remaining: number;
   errors: string[];
 }> {
   const db = getDb();
@@ -100,11 +104,18 @@ export async function runFullSync(sourceFilter?: "notion" | "turso"): Promise<{
     documentsProcessed++;
   }
 
-  console.log(`${changedDocs.length} documents changed, ${chunksSkipped} unchanged`);
+  console.log(`${changedDocs.length} documents need processing, ${chunksSkipped} unchanged`);
 
   if (changedDocs.length === 0) {
     console.log("No changes detected. Sync complete.");
-    return { documentsProcessed, chunksCreated, chunksSkipped, errors };
+    return { documentsProcessed, chunksCreated, chunksSkipped, remaining: 0, errors };
+  }
+
+  // Limit batch size to avoid timeout
+  const docsToProcess = changedDocs.slice(0, MAX_DOCS_PER_BATCH);
+  const remaining = changedDocs.length - docsToProcess.length;
+  if (remaining > 0) {
+    console.log(`Processing ${docsToProcess.length} of ${changedDocs.length} docs (${remaining} remaining for next run)`);
   }
 
   // 3. Chunk changed documents
@@ -117,7 +128,7 @@ export async function runFullSync(sourceFilter?: "notion" | "turso"): Promise<{
     metadata: string;
   }> = [];
 
-  for (const doc of changedDocs) {
+  for (const doc of docsToProcess) {
     // Delete old chunks for this document
     await db.execute({
       sql: "DELETE FROM chunks WHERE document_id = ? AND document_source = ?",
@@ -137,7 +148,7 @@ export async function runFullSync(sourceFilter?: "notion" | "turso"): Promise<{
     }
   }
 
-  console.log(`Generated ${allChunks.length} chunks from ${changedDocs.length} documents`);
+  console.log(`Generated ${allChunks.length} chunks from ${docsToProcess.length} documents`);
 
   // 4. Generate embeddings in batch
   const chunkTexts = allChunks.map((c) => c.content);
@@ -149,7 +160,7 @@ export async function runFullSync(sourceFilter?: "notion" | "turso"): Promise<{
     const msg = `Embedding generation failed: ${error.message}`;
     console.error(msg);
     errors.push(msg);
-    return { documentsProcessed, chunksCreated, chunksSkipped, errors };
+    return { documentsProcessed, chunksCreated, chunksSkipped, remaining, errors };
   }
 
   // 5. Store chunks with embeddings
@@ -185,7 +196,13 @@ export async function runFullSync(sourceFilter?: "notion" | "turso"): Promise<{
     }
   }
 
-  // 6. Clean up orphaned documents (removed from source)
+  // 6. Clean up orphaned documents (only when fully synced, not partial batch)
+  if (remaining > 0) {
+    console.log("Skipping orphan cleanup (partial batch)");
+    console.log(`Sync complete: ${documentsProcessed} docs processed, ${chunksCreated} chunks created, ${remaining} remaining`);
+    return { documentsProcessed, chunksCreated, chunksSkipped, remaining, errors };
+  }
+
   const allDocIds = new Set(allDocs.map((d) => `${d.source}:${d.id}`));
   const storedDocs = await db.execute({
     sql: "SELECT source, id FROM documents",
@@ -206,6 +223,6 @@ export async function runFullSync(sourceFilter?: "notion" | "turso"): Promise<{
     }
   }
 
-  console.log(`Sync complete: ${documentsProcessed} docs processed, ${chunksCreated} chunks created`);
-  return { documentsProcessed, chunksCreated, chunksSkipped, errors };
+  console.log(`Sync complete: ${documentsProcessed} docs processed, ${chunksCreated} chunks created, ${remaining} remaining`);
+  return { documentsProcessed, chunksCreated, chunksSkipped, remaining, errors };
 }
