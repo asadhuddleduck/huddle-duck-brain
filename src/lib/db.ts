@@ -2,6 +2,26 @@ import { createClient, type Client } from "@libsql/client";
 import { SYNC_LOCK_TIMEOUT_SECONDS } from "./constants";
 import type { HealthStatus } from "./types";
 
+// ---------------------------------------------------------------------------
+// TURSO CONNECTION MODEL:
+// ---------------------------------------------------------------------------
+// One singleton Client per serverless function lifecycle (module-level cache).
+// On Vercel, each function invocation gets its own V8 isolate, so there is
+// no shared state between concurrent requests. This means:
+//   - No connection contention: each concurrent request has its own client
+//   - No pooling needed: Turso's HTTP client is stateless (no persistent TCP)
+//   - Cold start cost: ~50-100ms for createClient() + first query
+//   - Warm reuse: subsequent calls within the same invocation reuse _db
+//
+// Turso free tier allows 500 connections. At 100 concurrent serverless
+// functions, that is 100 connections — well within limits.
+//
+// TODO: If query volume exceeds ~500 concurrent functions, consider:
+// 1. Turso read replicas (distribute load geographically)
+// 2. Connection pooling via Turso's edge proxy
+// 3. Caching hot query results in Vercel KV (TTL 5-15 min)
+// ---------------------------------------------------------------------------
+
 let _db: Client | null = null;
 
 export function getDb(): Client {
@@ -25,7 +45,29 @@ export const db = new Proxy({} as Client, {
   },
 });
 
-export async function initSchema(): Promise<void> {
+// ---------------------------------------------------------------------------
+// Schema initialization — cached per function lifecycle
+// ---------------------------------------------------------------------------
+// SCALABILITY FIX: initSchema() was running 7+ SQL statements (CREATE TABLE
+// IF NOT EXISTS, CREATE INDEX IF NOT EXISTS) on EVERY request. At scale this
+// adds ~50-100ms of unnecessary overhead per request. Now it runs once per
+// serverless function lifecycle and subsequent calls are a no-op.
+// ---------------------------------------------------------------------------
+
+let _schemaInitialized: Promise<void> | null = null;
+
+export function initSchema(): Promise<void> {
+  if (!_schemaInitialized) {
+    _schemaInitialized = _initSchemaOnce().catch((err) => {
+      // Reset on failure so next call retries
+      _schemaInitialized = null;
+      throw err;
+    });
+  }
+  return _schemaInitialized;
+}
+
+async function _initSchemaOnce(): Promise<void> {
   const db = getDb();
 
   await db.batch([
@@ -84,6 +126,18 @@ export async function initSchema(): Promise<void> {
       )`,
       args: [],
     },
+    // Token usage tracking — monitors Voyage AI consumption against free tier
+    {
+      sql: `CREATE TABLE IF NOT EXISTS token_usage (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source TEXT NOT NULL,
+        tokens_used INTEGER NOT NULL,
+        operation TEXT NOT NULL,
+        batch_size INTEGER,
+        created_at TEXT DEFAULT (datetime('now'))
+      )`,
+      args: [],
+    },
     // Indexes
     {
       sql: `CREATE INDEX IF NOT EXISTS idx_documents_source ON documents(source)`,
@@ -95,6 +149,10 @@ export async function initSchema(): Promise<void> {
     },
     {
       sql: `CREATE INDEX IF NOT EXISTS idx_chunks_document ON chunks(document_source, document_id)`,
+      args: [],
+    },
+    {
+      sql: `CREATE INDEX IF NOT EXISTS idx_token_usage_date ON token_usage(created_at)`,
       args: [],
     },
   ]);
@@ -109,6 +167,64 @@ export async function initSchema(): Promise<void> {
     // Index may already exist or vector extension syntax differs
     console.warn("[db] Vector index creation skipped (may already exist)");
   }
+}
+
+// ---------------------------------------------------------------------------
+// Token Usage Tracking — monitors Voyage AI consumption
+// ---------------------------------------------------------------------------
+
+/** Record token usage for rate limit headroom tracking */
+export async function recordTokenUsage(
+  source: string,
+  tokensUsed: number,
+  operation: "embed" | "query",
+  batchSize?: number
+): Promise<void> {
+  try {
+    const db = getDb();
+    await db.execute({
+      sql: `INSERT INTO token_usage (source, tokens_used, operation, batch_size)
+            VALUES (?, ?, ?, ?)`,
+      args: [source, tokensUsed, operation, batchSize ?? null],
+    });
+  } catch {
+    // Non-critical — don't let tracking failures break main operations
+    console.warn("[db] Failed to record token usage");
+  }
+}
+
+/** Get token usage for the current month */
+export async function getMonthlyTokenUsage(): Promise<{
+  total_tokens: number;
+  embed_tokens: number;
+  query_tokens: number;
+  free_tier_limit: number;
+  usage_percent: number;
+}> {
+  const db = getDb();
+  const FREE_TIER_LIMIT = 200_000_000; // 200M tokens/month
+
+  const result = await db.execute({
+    sql: `SELECT
+            COALESCE(SUM(tokens_used), 0) as total,
+            COALESCE(SUM(CASE WHEN operation = 'embed' THEN tokens_used ELSE 0 END), 0) as embed,
+            COALESCE(SUM(CASE WHEN operation = 'query' THEN tokens_used ELSE 0 END), 0) as query_tokens
+          FROM token_usage
+          WHERE created_at >= datetime('now', 'start of month')`,
+    args: [],
+  });
+
+  const total = (result.rows[0]?.total as number) || 0;
+  const embed = (result.rows[0]?.embed as number) || 0;
+  const queryTokens = (result.rows[0]?.query_tokens as number) || 0;
+
+  return {
+    total_tokens: total,
+    embed_tokens: embed,
+    query_tokens: queryTokens,
+    free_tier_limit: FREE_TIER_LIMIT,
+    usage_percent: Math.round((total / FREE_TIER_LIMIT) * 10000) / 100,
+  };
 }
 
 export async function updateSyncStatus(

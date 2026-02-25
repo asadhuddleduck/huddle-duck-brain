@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "@libsql/client": "^0.17.0",
-    "@modelcontextprotocol/sdk": "^1.25.2",
+    "@modelcontextprotocol/sdk": "^1.27.1",
     "@notionhq/client": "^5.9.0",
     "mcp-handler": "^1.0.7",
     "next": "16.1.6",

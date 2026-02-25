@@ -81,3 +81,10 @@ export const DEFAULT_MAX_RETRY_ATTEMPTS = 3;
 
 /** Default base delay in ms for exponential backoff */
 export const DEFAULT_RETRY_BASE_DELAY_MS = 1000;
+
+// ---------------------------------------------------------------------------
+// Batch Storage
+// ---------------------------------------------------------------------------
+
+/** Number of chunks to store per db.batch() call (reduces round trips) */
+export const CHUNK_BATCH_SIZE = 50;

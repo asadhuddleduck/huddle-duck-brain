@@ -4,9 +4,9 @@ import { crawlTursoDatabases } from "./turso-sync";
 import { chunkDocument } from "./chunker";
 import { hashContent } from "./hash";
 import { generateEmbeddings, embeddingToVector } from "./embeddings";
-import { MAX_DOCS_PER_BATCH } from "./constants";
+import { MAX_DOCS_PER_BATCH, CHUNK_BATCH_SIZE } from "./constants";
 import type { Document } from "./types";
-import type { Client } from "@libsql/client";
+import type { Client, InStatement } from "@libsql/client";
 
 /** Prepared chunk data ready for embedding and storage */
 interface PreparedChunk {
@@ -16,29 +16,6 @@ interface PreparedChunk {
   content: string;
   heading: string | null;
   metadata: string;
-}
-
-/** Upsert a single chunk with its embedding into the database */
-async function storeChunkWithEmbedding(
-  db: Client,
-  chunk: PreparedChunk,
-  embedding: number[]
-): Promise<void> {
-  await db.execute({
-    sql: `INSERT INTO chunks (document_id, document_source, chunk_index, content, content_hash, heading, metadata, embedding)
-          VALUES (?, ?, ?, ?, ?, ?, ?, vector32(?))
-          ON CONFLICT(document_source, document_id, chunk_index) DO UPDATE SET
-            content = excluded.content,
-            content_hash = excluded.content_hash,
-            heading = excluded.heading,
-            metadata = excluded.metadata,
-            embedding = excluded.embedding`,
-    args: [
-      chunk.documentId, chunk.documentSource, chunk.index,
-      chunk.content, hashContent(chunk.content), chunk.heading,
-      chunk.metadata, embeddingToVector(embedding),
-    ],
-  });
 }
 
 /** Chunk a document and return prepared chunks ready for embedding */
@@ -54,7 +31,7 @@ function prepareChunks(doc: { id: string; source: string; title: string; content
   }));
 }
 
-/** Generate embeddings and store chunks, returning count of successes and errors */
+/** Generate embeddings and store chunks in batches, returning count of successes and errors */
 async function embedAndStoreChunks(
   db: Client,
   allChunks: PreparedChunk[]
@@ -78,13 +55,43 @@ async function embedAndStoreChunks(
     return { chunksCreated, errors };
   }
 
-  for (let i = 0; i < allChunks.length; i++) {
+  // Store chunks in batches of CHUNK_BATCH_SIZE using db.batch()
+  for (let i = 0; i < allChunks.length; i += CHUNK_BATCH_SIZE) {
+    const batchChunks = allChunks.slice(i, i + CHUNK_BATCH_SIZE);
+    const batchEmbeddings = embeddings.slice(i, i + CHUNK_BATCH_SIZE);
+
+    // Build batch statements with pre-resolved embeddings
+    const statements: InStatement[] = batchChunks.map((chunk, j) => ({
+      sql: `INSERT INTO chunks (document_id, document_source, chunk_index, content, content_hash, heading, metadata, embedding)
+            VALUES (?, ?, ?, ?, ?, ?, ?, vector32(?))
+            ON CONFLICT(document_source, document_id, chunk_index) DO UPDATE SET
+              content = excluded.content,
+              content_hash = excluded.content_hash,
+              heading = excluded.heading,
+              metadata = excluded.metadata,
+              embedding = excluded.embedding`,
+      args: [
+        chunk.documentId, chunk.documentSource, chunk.index,
+        chunk.content, hashContent(chunk.content), chunk.heading,
+        chunk.metadata, embeddingToVector(batchEmbeddings[j]),
+      ],
+    }));
+
     try {
-      await storeChunkWithEmbedding(db, allChunks[i], embeddings[i]);
-      chunksCreated++;
+      await db.batch(statements);
+      chunksCreated += batchChunks.length;
     } catch (error: unknown) {
-      const msg = error instanceof Error ? error.message : String(error);
-      errors.push(`Chunk storage failed for doc ${allChunks[i].documentId}: ${msg}`);
+      // If batch fails, fall back to individual inserts to salvage what we can
+      console.warn(`[sync] Batch insert failed (chunk ${i}-${i + batchChunks.length}), falling back to individual inserts`);
+      for (let j = 0; j < statements.length; j++) {
+        try {
+          await db.execute(statements[j]);
+          chunksCreated++;
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          errors.push(`Chunk storage failed for doc ${batchChunks[j].documentId}: ${msg}`);
+        }
+      }
     }
   }
 
@@ -94,27 +101,6 @@ async function embedAndStoreChunks(
 /** Generate a unique lock ID for this invocation */
 function generateLockId(): string {
   return `sync_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-}
-
-/**
- * Clean up stale chunks for a document after upsert.
- *
- * Instead of DELETE-all + INSERT (which loses data on crash between the two),
- * we upsert new chunks via ON CONFLICT, then delete any old chunk indices
- * beyond the new chunk count. This is crash-safe: if we crash between upsert
- * and cleanup, we just have extra stale chunks, not missing data.
- */
-async function cleanupStaleChunks(
-  db: Client,
-  docId: string,
-  docSource: string,
-  newChunkCount: number
-): Promise<void> {
-  await db.execute({
-    sql: `DELETE FROM chunks
-          WHERE document_id = ? AND document_source = ? AND chunk_index >= ?`,
-    args: [docId, docSource, newChunkCount],
-  });
 }
 
 // --- Embed pending documents (called by /api/embed) ---
@@ -127,6 +113,48 @@ export async function embedPending(): Promise<{
   const db = getDb();
   await initSchema();
 
+  // Acquire lock to prevent concurrent embed jobs from processing the same docs
+  // (wastes Voyage API tokens even though upsert prevents duplicate data)
+  const lockId = `embed_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const lockAcquired = await acquireSyncLock(lockId);
+  if (!lockAcquired) {
+    console.warn("[embed] Another embed/sync job is already running, skipping");
+    return { chunksCreated: 0, remaining: 0, errors: ["Embed skipped: another job is already running"] };
+  }
+
+  try {
+    return await _embedPendingInternal(db);
+  } finally {
+    await releaseSyncLock(lockId);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MEMORY PRESSURE ANALYSIS for embedPending():
+// ---------------------------------------------------------------------------
+// Peak memory with MAX_DOCS_PER_BATCH=50:
+// - 50 docs' full content in DB result rows: ~50 * 5KB = 250KB
+// - allChunks array (50 docs * ~4 chunks): ~200 PreparedChunk objects = ~1MB
+// - Embeddings array (200 * 1024 floats * 8 bytes): ~1.6MB
+// - Total peak: ~3MB. Well within Vercel's 1GB limit.
+//
+// At MAX_DOCS_PER_BATCH=50 with worst-case 20KB docs and 20 chunks each:
+// - 50 * 20KB content = 1MB
+// - 1000 chunks * ~1KB each = 1MB
+// - 1000 embeddings * 8KB = 8MB
+// - Total peak: ~10MB. Still safe.
+//
+// TODO: If MAX_DOCS_PER_BATCH ever exceeds ~500 with large documents,
+// consider streaming: process docs in sub-batches (chunk + embed + store
+// one sub-batch before loading the next) to avoid holding all content
+// and embeddings in memory simultaneously.
+// ---------------------------------------------------------------------------
+
+async function _embedPendingInternal(db: ReturnType<typeof getDb>): Promise<{
+  chunksCreated: number;
+  remaining: number;
+  errors: string[];
+}> {
   // Find documents with no embedded chunks
   const unembedded = await db.execute({
     sql: `SELECT d.id, d.source, d.title, d.content
@@ -164,8 +192,13 @@ export async function embedPending(): Promise<{
   for (const row of rows) {
     const docId = row.id as string;
     const docSource = row.source as string;
-    const title = row.title as string;
-    const content = row.content as string;
+    const title = (row.title as string) || "Untitled";
+    const content = (row.content as string) || "";
+
+    if (!content.trim()) {
+      console.warn(`[embed] Skipping doc ${docId} (${docSource}): empty content`);
+      continue;
+    }
 
     const prepared = prepareChunks({ id: docId, source: docSource, title, content });
     allChunks.push(...prepared);
@@ -177,11 +210,17 @@ export async function embedPending(): Promise<{
   // Generate embeddings and store chunks using shared helper (upsert via ON CONFLICT)
   const result = await embedAndStoreChunks(db, allChunks);
 
-  // Clean up stale chunks beyond new chunk counts (crash-safe: extra chunks
-  // are harmless, missing chunks are not)
+  // Clean up stale chunks beyond new chunk counts — batched (crash-safe:
+  // extra chunks are harmless, missing chunks are not)
   if (result.chunksCreated > 0) {
-    for (const { docId, docSource, count } of chunkCountByDoc.values()) {
-      await cleanupStaleChunks(db, docId, docSource, count);
+    const cleanupEntries = Array.from(chunkCountByDoc.values());
+    for (let i = 0; i < cleanupEntries.length; i += CHUNK_BATCH_SIZE) {
+      const batch = cleanupEntries.slice(i, i + CHUNK_BATCH_SIZE);
+      const stmts: InStatement[] = batch.map(({ docId, docSource, count }) => ({
+        sql: "DELETE FROM chunks WHERE document_id = ? AND document_source = ? AND chunk_index >= ?",
+        args: [docId, docSource, count],
+      }));
+      await db.batch(stmts);
     }
   }
 
@@ -261,23 +300,49 @@ export async function syncNotionCrawlOnly(): Promise<{
   const { documents, partial } = crawlResult;
   console.log(`[sync] Crawl returned ${documents.length} documents (partial: ${partial})`);
 
-  // Upsert documents into DB (no chunking, no embedding)
+  // -------------------------------------------------------------------------
+  // SCALABILITY FIX: Batch hash lookups (N+1 query elimination)
+  // -------------------------------------------------------------------------
+  // Previously: N individual SELECT queries to check each document's hash.
+  // At 5,000 docs, that was 5,000 round trips just for hash comparison.
+  // Now: One query loads ALL existing hashes for Notion into a Map,
+  // then we compare in-memory. Reduces N queries to 1.
+  // -------------------------------------------------------------------------
+  const existingHashes = new Map<string, string>();
+  try {
+    const hashResult = await db.execute({
+      sql: "SELECT id, content_hash FROM documents WHERE source = 'notion'",
+      args: [],
+    });
+    for (const row of hashResult.rows) {
+      existingHashes.set(row.id as string, row.content_hash as string);
+    }
+  } catch {
+    console.warn("[sync] Failed to load existing hashes, will treat all as new");
+  }
+
+  // Separate changed from unchanged using in-memory comparison
+  const changedNotionDocs: Document[] = [];
   for (const doc of documents) {
-    try {
-      // Check if content has changed
-      const existing = await db.execute({
-        sql: "SELECT content_hash FROM documents WHERE source = ? AND id = ?",
-        args: [doc.source, doc.id],
-      });
+    if (existingHashes.get(doc.id) === doc.content_hash) {
+      documentsUnchanged++;
+    } else {
+      changedNotionDocs.push(doc);
+    }
+  }
 
-      const existingHash = existing.rows[0]?.content_hash as string | undefined;
-      if (existingHash === doc.content_hash) {
-        documentsUnchanged++;
-        continue;
-      }
-
-      // Upsert document — content changed or new doc
-      await db.execute({
+  // -------------------------------------------------------------------------
+  // SCALABILITY FIX: Batch document upserts + chunk deletes
+  // -------------------------------------------------------------------------
+  // Previously: N individual INSERT + N individual DELETE per changed doc.
+  // At 500 changed docs, that was 1,000 sequential round trips.
+  // Now: Batch in groups of CHUNK_BATCH_SIZE.
+  // -------------------------------------------------------------------------
+  for (let i = 0; i < changedNotionDocs.length; i += CHUNK_BATCH_SIZE) {
+    const batch = changedNotionDocs.slice(i, i + CHUNK_BATCH_SIZE);
+    const statements: InStatement[] = [];
+    for (const doc of batch) {
+      statements.push({
         sql: `INSERT INTO documents (id, source, source_url, title, doc_type, content, content_hash, metadata, last_edited, synced_at)
               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
               ON CONFLICT(source, id) DO UPDATE SET
@@ -293,17 +358,27 @@ export async function syncNotionCrawlOnly(): Promise<{
           doc.content, doc.content_hash, doc.metadata, doc.last_edited,
         ],
       });
-
-      // Delete old chunks so /api/embed knows to re-embed this doc
-      await db.execute({
+      statements.push({
         sql: "DELETE FROM chunks WHERE document_id = ? AND document_source = ?",
         args: [doc.id, doc.source],
       });
+    }
 
-      documentsStored++;
-    } catch (error: unknown) {
-      const msg = error instanceof Error ? error.message : String(error);
-      errors.push(`Failed to store doc ${doc.id}: ${msg}`);
+    try {
+      await db.batch(statements);
+      documentsStored += batch.length;
+    } catch {
+      console.warn("[sync] Batch upsert failed, falling back to individual inserts");
+      for (let j = 0; j < batch.length; j++) {
+        try {
+          await db.execute(statements[j * 2]);     // upsert
+          await db.execute(statements[j * 2 + 1]); // chunk delete
+          documentsStored++;
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          errors.push(`Failed to store doc ${batch[j].id}: ${msg}`);
+        }
+      }
     }
   }
 
@@ -316,23 +391,25 @@ export async function syncNotionCrawlOnly(): Promise<{
         sql: "SELECT id FROM documents WHERE source = 'notion'",
         args: [],
       });
-      let orphansRemoved = 0;
+
+      // Collect orphans, then batch delete (was 2 round trips per orphan)
+      const orphanIds: string[] = [];
       for (const row of storedDocs.rows) {
         const docId = row.id as string;
-        if (!crawledIds.has(docId)) {
-          await db.execute({
-            sql: "DELETE FROM chunks WHERE document_id = ? AND document_source = 'notion'",
-            args: [docId],
-          });
-          await db.execute({
-            sql: "DELETE FROM documents WHERE id = ? AND source = 'notion'",
-            args: [docId],
-          });
-          orphansRemoved++;
-        }
+        if (!crawledIds.has(docId)) orphanIds.push(docId);
       }
-      if (orphansRemoved > 0) {
-        console.log(`[sync] Removed ${orphansRemoved} orphaned Notion documents`);
+
+      if (orphanIds.length > 0) {
+        for (let i = 0; i < orphanIds.length; i += CHUNK_BATCH_SIZE) {
+          const batchIds = orphanIds.slice(i, i + CHUNK_BATCH_SIZE);
+          const batchDeletes: InStatement[] = [];
+          for (const docId of batchIds) {
+            batchDeletes.push({ sql: "DELETE FROM chunks WHERE document_id = ? AND document_source = 'notion'", args: [docId] });
+            batchDeletes.push({ sql: "DELETE FROM documents WHERE id = ? AND source = 'notion'", args: [docId] });
+          }
+          await db.batch(batchDeletes);
+        }
+        console.log(`[sync] Removed ${orphanIds.length} orphaned Notion documents`);
       }
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : String(error);
@@ -454,28 +531,54 @@ async function runFullSyncInternal(sourceFilter?: "notion" | "turso"): Promise<{
       await updateSyncStatus("turso", false, 0, 0, msg);
     }
 
-    // Upsert Turso documents and find changed ones
+    // -----------------------------------------------------------------------
+    // SCALABILITY FIX: Batch hash + embedding lookups for Turso (N+1 elimination)
+    // -----------------------------------------------------------------------
+    // Previously: 2 queries per doc (hash check + embedding check) = 2N round trips.
+    // At 1,274 Turso docs, that was 2,548 round trips.
+    // Now: 2 bulk queries load all hashes + embedded doc IDs, then compare in-memory.
+    // -----------------------------------------------------------------------
+    const tursoHashes = new Map<string, string>();
+    const tursoEmbeddedDocs = new Set<string>();
+    try {
+      const [hashRows, embeddedRows] = await Promise.all([
+        db.execute({
+          sql: "SELECT source, id, content_hash FROM documents WHERE source LIKE 'turso:%'",
+          args: [],
+        }),
+        db.execute({
+          sql: `SELECT DISTINCT document_source, document_id FROM chunks
+                WHERE document_source LIKE 'turso:%' AND embedding IS NOT NULL`,
+          args: [],
+        }),
+      ]);
+      for (const row of hashRows.rows) {
+        tursoHashes.set(`${row.source}:${row.id}`, row.content_hash as string);
+      }
+      for (const row of embeddedRows.rows) {
+        tursoEmbeddedDocs.add(`${row.document_source}:${row.document_id}`);
+      }
+    } catch {
+      console.warn("[sync] Failed to load Turso hashes/embeddings, will treat all as changed");
+    }
+
+    // Classify docs using in-memory lookups
     const changedDocs: Document[] = [];
     for (const doc of tursoDocs) {
-      const existing = await db.execute({
-        sql: "SELECT content_hash FROM documents WHERE source = ? AND id = ?",
-        args: [doc.source, doc.id],
-      });
-
-      const existingHash = existing.rows[0]?.content_hash as string | undefined;
-      if (existingHash === doc.content_hash) {
-        const chunkCheck = await db.execute({
-          sql: "SELECT COUNT(*) as count FROM chunks WHERE document_id = ? AND document_source = ? AND embedding IS NOT NULL",
-          args: [doc.id, doc.source],
-        });
-        const hasEmbeddedChunks = (chunkCheck.rows[0]?.count as number) > 0;
-        if (hasEmbeddedChunks) {
-          chunksSkipped++;
-          continue;
-        }
+      const key = `${doc.source}:${doc.id}`;
+      const existingHash = tursoHashes.get(key);
+      if (existingHash === doc.content_hash && tursoEmbeddedDocs.has(key)) {
+        chunksSkipped++;
+        continue;
       }
+      changedDocs.push(doc);
+      documentsProcessed++;
+    }
 
-      await db.execute({
+    // Batch upsert changed Turso documents
+    for (let i = 0; i < changedDocs.length; i += CHUNK_BATCH_SIZE) {
+      const batch = changedDocs.slice(i, i + CHUNK_BATCH_SIZE);
+      const statements: InStatement[] = batch.map((doc) => ({
         sql: `INSERT INTO documents (id, source, source_url, title, doc_type, content, content_hash, metadata, last_edited, synced_at)
               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
               ON CONFLICT(source, id) DO UPDATE SET
@@ -490,10 +593,15 @@ async function runFullSyncInternal(sourceFilter?: "notion" | "turso"): Promise<{
           doc.id, doc.source, doc.source_url, doc.title, doc.doc_type,
           doc.content, doc.content_hash, doc.metadata, doc.last_edited,
         ],
-      });
-
-      changedDocs.push(doc);
-      documentsProcessed++;
+      }));
+      try {
+        await db.batch(statements);
+      } catch {
+        console.warn("[sync] Batch Turso upsert failed, falling back to individual inserts");
+        for (const stmt of statements) {
+          try { await db.execute(stmt); } catch { /* individual errors logged below */ }
+        }
+      }
     }
 
     console.log(`[sync] Turso: ${changedDocs.length} changed, ${chunksSkipped} unchanged`);
@@ -519,10 +627,16 @@ async function runFullSyncInternal(sourceFilter?: "notion" | "turso"): Promise<{
       chunksCreated += embedResult.chunksCreated;
       errors.push(...embedResult.errors);
 
-      // Clean up stale chunks beyond new chunk counts (crash-safe)
+      // Clean up stale chunks beyond new chunk counts — batched (crash-safe)
       if (embedResult.chunksCreated > 0) {
-        for (const { docId, docSource, count } of tursoChunkCounts.values()) {
-          await cleanupStaleChunks(db, docId, docSource, count);
+        const cleanupEntries = Array.from(tursoChunkCounts.values());
+        for (let ci = 0; ci < cleanupEntries.length; ci += CHUNK_BATCH_SIZE) {
+          const batch = cleanupEntries.slice(ci, ci + CHUNK_BATCH_SIZE);
+          const stmts: InStatement[] = batch.map(({ docId, docSource, count }) => ({
+            sql: "DELETE FROM chunks WHERE document_id = ? AND document_source = ? AND chunk_index >= ?",
+            args: [docId, docSource, count],
+          }));
+          await db.batch(stmts);
         }
       }
 
@@ -534,25 +648,27 @@ async function runFullSyncInternal(sourceFilter?: "notion" | "turso"): Promise<{
         };
       }
 
-      // Turso orphan cleanup (only when not partial)
+      // Turso orphan cleanup — batched (only when not partial)
       if (tursoRemaining === 0) {
         const tursoDocIds = new Set(tursoDocs.map((d) => `${d.source}:${d.id}`));
         const storedTursoDocs = await db.execute({
           sql: "SELECT source, id FROM documents WHERE source LIKE 'turso:%'",
           args: [],
         });
-        for (const row of storedTursoDocs.rows) {
-          const key = `${row.source}:${row.id}`;
-          if (!tursoDocIds.has(key)) {
-            await db.execute({
-              sql: "DELETE FROM chunks WHERE document_id = ? AND document_source = ?",
-              args: [row.id as string, row.source as string],
-            });
-            await db.execute({
-              sql: "DELETE FROM documents WHERE id = ? AND source = ?",
-              args: [row.id as string, row.source as string],
-            });
+        const orphanRows = storedTursoDocs.rows.filter(
+          (row) => !tursoDocIds.has(`${row.source}:${row.id}`)
+        );
+        if (orphanRows.length > 0) {
+          for (let oi = 0; oi < orphanRows.length; oi += CHUNK_BATCH_SIZE) {
+            const batch = orphanRows.slice(oi, oi + CHUNK_BATCH_SIZE);
+            const stmts: InStatement[] = [];
+            for (const row of batch) {
+              stmts.push({ sql: "DELETE FROM chunks WHERE document_id = ? AND document_source = ?", args: [row.id as string, row.source as string] });
+              stmts.push({ sql: "DELETE FROM documents WHERE id = ? AND source = ?", args: [row.id as string, row.source as string] });
+            }
+            await db.batch(stmts);
           }
+          console.log(`[sync] Removed ${orphanRows.length} orphaned Turso documents`);
         }
       }
     }

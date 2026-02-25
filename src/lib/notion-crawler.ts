@@ -1,4 +1,16 @@
 // src/lib/notion-crawler.ts
+//
+// COLD START ANALYSIS:
+// This module is imported by sync-engine.ts which is imported by /api/sync.
+// The @notionhq/client package is ~50KB bundled. The Client is initialized
+// at module load time (reads NOTION_TOKEN from env). This adds ~20-30ms
+// to cold start but is acceptable since:
+//   - /api/sync is only called by cron (6x/day), not user-facing
+//   - /api/query and /api/mcp do NOT import this module (no impact)
+//
+// TODO: If cold start becomes an issue for sync routes, lazy-initialize
+// the Notion client (same pattern as db.ts getDb()).
+//
 import { Client } from "@notionhq/client";
 import { RateLimiter } from "./retry";
 import { hashContent } from "./hash";

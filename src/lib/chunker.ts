@@ -9,8 +9,8 @@ export interface TextChunk {
   metadata: { charStart: number; charEnd: number };
 }
 
-export function chunkDocument(text: string, title: string): TextChunk[] {
-  if (!text.trim()) return [];
+export function chunkDocument(text: string | null | undefined, title: string): TextChunk[] {
+  if (!text || !text.trim()) return [];
 
   // Short documents: single chunk
   if (text.length <= MAX_CHUNK_SIZE) {
@@ -165,6 +165,9 @@ function forceSplit(text: string, title: string): TextChunk[] {
   let i = 0;
   let chunkIndex = 0;
 
+  // Guard: ensure forward progress even if CHUNK_OVERLAP >= MAX_CHUNK_SIZE
+  const effectiveOverlap = Math.min(CHUNK_OVERLAP, MAX_CHUNK_SIZE - 1);
+
   while (i < text.length) {
     const end = Math.min(i + MAX_CHUNK_SIZE, text.length);
     const content = chunkIndex === 0
@@ -178,7 +181,9 @@ function forceSplit(text: string, title: string): TextChunk[] {
       metadata: { charStart: i, charEnd: end },
     });
 
-    i = end - CHUNK_OVERLAP;
+    const nextI = end - effectiveOverlap;
+    if (nextI <= i) break; // Safety: prevent infinite loop
+    i = nextI;
     if (i >= text.length) break;
   }
 

@@ -1,5 +1,6 @@
 // src/lib/embeddings.ts
 import { withRetry } from "./retry";
+import { recordTokenUsage } from "./db";
 import {
   VOYAGE_API_URL,
   VOYAGE_MODEL,
@@ -74,6 +75,14 @@ export async function generateEmbeddings(
       return res.json() as Promise<VoyageResponse>;
     });
 
+    // Validate response contains expected number of embeddings
+    if (response.data.length !== batch.length) {
+      throw new EmbeddingServiceError(
+        `Voyage API returned ${response.data.length} embeddings for ${batch.length} inputs (batch offset ${i})`,
+        undefined
+      );
+    }
+
     for (const item of response.data) {
       allEmbeddings[i + item.index] = item.embedding;
     }
@@ -81,7 +90,23 @@ export async function generateEmbeddings(
     totalTokens += response.usage.total_tokens;
   }
 
+  // Final safety check: ensure no undefined slots in the embeddings array
+  for (let i = 0; i < allEmbeddings.length; i++) {
+    if (!allEmbeddings[i]) {
+      throw new EmbeddingServiceError(
+        `Missing embedding at index ${i} — Voyage API response had gaps`,
+        undefined
+      );
+    }
+  }
+
   console.log(`[embeddings] Generated ${texts.length} embeddings (${totalTokens} tokens)`);
+
+  // SCALABILITY FIX: Track token usage for rate limit headroom monitoring.
+  // Persists to token_usage table so we can calculate monthly consumption
+  // against the 200M free tier limit. Non-blocking (fire and forget).
+  recordTokenUsage("voyage-ai", totalTokens, "embed", texts.length).catch(() => {});
+
   return allEmbeddings;
 }
 
@@ -114,11 +139,23 @@ export async function generateQueryEmbedding(query: string): Promise<number[]> {
   }
 
   const data = (await res.json()) as VoyageResponse;
+  if (!data.data?.[0]?.embedding) {
+    throw new EmbeddingServiceError("Voyage API returned empty embedding response");
+  }
+
+  // Track query token usage (non-blocking)
+  if (data.usage?.total_tokens) {
+    recordTokenUsage("voyage-ai", data.usage.total_tokens, "query", 1).catch(() => {});
+  }
+
   return data.data[0].embedding;
 }
 
 /** Convert embedding array to Turso vector format string */
 export function embeddingToVector(embedding: number[]): string {
+  if (!embedding || !Array.isArray(embedding) || embedding.length === 0) {
+    throw new Error("embeddingToVector: received null, undefined, or empty embedding array");
+  }
   return `[${embedding.join(",")}]`;
 }
 

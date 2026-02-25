@@ -12,7 +12,7 @@ Standalone Knowledge API that indexes the entire Huddle Duck Notion workspace an
 ## Key Files
 | File | Purpose |
 |---|---|
-| src/lib/db.ts | Turso connection + schema init |
+| src/lib/db.ts | Turso connection, schema init (cached), sync status, locking, token usage tracking |
 | src/lib/notion-crawler.ts | Full Notion workspace crawl |
 | src/lib/turso-sync.ts | Cross-project Turso data extraction |
 | src/lib/chunker.ts | Smart text splitting |

@@ -110,6 +110,17 @@ const SOURCES: TursoSource[] = [
   },
 ];
 
+/** Safe JSON.stringify that handles BigInt values (common in Turso INTEGER columns) */
+function safeStringify(obj: unknown): string {
+  try {
+    return JSON.stringify(obj, (_key, value) =>
+      typeof value === "bigint" ? Number(value) : value
+    );
+  } catch {
+    return "{}";
+  }
+}
+
 function connectToSource(source: TursoSource): Client | null {
   const url = process.env[source.urlEnv]?.trim();
   const token = process.env[source.tokenEnv]?.trim();
@@ -125,6 +136,8 @@ function rowToContent(row: Record<string, unknown>, contentColumns: string[]): s
     .map((col) => {
       const val = row[col];
       if (val === null || val === undefined || val === "") return null;
+      // Skip binary/buffer values that don't serialize to meaningful text
+      if (val instanceof ArrayBuffer || val instanceof Uint8Array) return null;
       return `${col}: ${val}`;
     })
     .filter(Boolean)
@@ -144,8 +157,13 @@ export async function crawlTursoDatabases(): Promise<Document[]> {
 
         for (const row of result.rows) {
           const rowObj = row as unknown as Record<string, unknown>;
-          const title = String(rowObj[query.titleColumn] || "Untitled");
-          const content = `# ${title}\nSource: ${source.name} / ${query.label}\n\n${rowToContent(rowObj, query.contentColumns)}`;
+          const title = String(rowObj[query.titleColumn] ?? "Untitled") || "Untitled";
+          const bodyContent = rowToContent(rowObj, query.contentColumns);
+
+          // Skip rows where all content columns are null/empty
+          if (!bodyContent.trim()) continue;
+
+          const content = `# ${title}\nSource: ${source.name} / ${query.label}\n\n${bodyContent}`;
           const id = rowObj.id
             ? String(rowObj.id)
             : `${query.label}_${hashContent(content).slice(0, 12)}`;
@@ -162,7 +180,7 @@ export async function crawlTursoDatabases(): Promise<Document[]> {
             doc_type: "turso_record",
             content,
             content_hash: hashContent(content),
-            metadata: JSON.stringify({ table: query.label, raw: rowObj }),
+            metadata: safeStringify({ table: query.label, raw: rowObj }),
             last_edited: lastEdited,
             synced_at: new Date().toISOString(),
           });

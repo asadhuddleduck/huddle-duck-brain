@@ -12,6 +12,19 @@ import { QueryError } from "./types";
 import type { Value } from "@libsql/client";
 
 // ---------------------------------------------------------------------------
+// Safe JSON parse — returns null on invalid JSON instead of crashing queries
+// ---------------------------------------------------------------------------
+function safeJsonParse(json: string | null | undefined): Record<string, unknown> | null {
+  if (!json) return null;
+  try {
+    return JSON.parse(json) as Record<string, unknown>;
+  } catch {
+    console.warn(`[query-engine] Failed to parse metadata JSON: ${json.slice(0, 100)}`);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Row shapes returned by SQL queries
 // ---------------------------------------------------------------------------
 
@@ -86,6 +99,24 @@ export async function queryKnowledge(request: QueryRequest): Promise<QueryRespon
 // ---------------------------------------------------------------------------
 // Vector similarity search
 // ---------------------------------------------------------------------------
+// VECTOR SEARCH AT SCALE:
+// Turso's vector_top_k uses brute-force cosine scan (not ANN/HNSW).
+// Performance characteristics:
+//   - 1K chunks:  <20ms   (current state, ~1,274 chunks)
+//   - 10K chunks: ~50ms   (fine for 6-12 month horizon)
+//   - 100K chunks: 200-500ms (degraded but usable)
+//   - 1M chunks:  2-5s    (unacceptable — need dedicated vector DB)
+//
+// TODO: At >50K chunks, evaluate:
+// 1. Turso ANN indexing (if/when shipped)
+// 2. Dedicated vector DB (Qdrant, Pinecone) for search, keep Turso for metadata
+// 3. Reduce dimensions from 1024 to 512 (halves scan time, minimal quality loss)
+//
+// TODO: Add FTS5 full-text search index as hybrid search fallback.
+// The current keyword fallback uses LIKE '%keyword%' which is a full table
+// scan. At 100K chunks this will be painfully slow (~1-2s).
+// FTS5 would give sub-10ms keyword searches at any scale.
+// ---------------------------------------------------------------------------
 
 async function vectorSearch(
   query: string,
@@ -140,7 +171,7 @@ async function vectorSearch(
       doc_type: r.doc_type,
       heading: r.heading ?? null,
       similarity,
-      metadata: r.doc_metadata ? JSON.parse(r.doc_metadata) as Record<string, unknown> : null,
+      metadata: safeJsonParse(r.doc_metadata),
     };
   });
 }
@@ -199,7 +230,7 @@ export async function searchByKeyword(
       doc_type: r.doc_type,
       heading: r.heading ?? null,
       similarity: KEYWORD_SEARCH_SIMILARITY,
-      metadata: r.metadata ? JSON.parse(r.metadata) as Record<string, unknown> : null,
+      metadata: safeJsonParse(r.metadata),
     };
   });
 }
