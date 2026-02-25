@@ -197,7 +197,7 @@ export async function crawlNotionWorkspace(): Promise<Document[]> {
   do {
     const response: any = await limiter.execute(() =>
       notion.search({
-        filter: { property: "object", value: "data_source" },
+        filter: { property: "object", value: "database" } as any,
         page_size: 100,
         start_cursor: cursor,
       })
@@ -281,8 +281,8 @@ export async function crawlNotionWorkspace(): Promise<Document[]> {
       let rowCursor: string | undefined;
       do {
         const rowResponse: any = await limiter.execute(() =>
-          notion.dataSources.query({
-            data_source_id: database.id,
+          (notion.databases as any).query({
+            database_id: database.id,
             page_size: 100,
             start_cursor: rowCursor,
           })
