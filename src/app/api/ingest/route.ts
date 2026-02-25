@@ -11,7 +11,14 @@ export async function POST(req: Request) {
   }
 
   try {
-    const result = await runFullSync();
+    const body = await req.json().catch(() => ({}));
+    const source = body.source as "notion" | "turso" | undefined;
+
+    if (source && source !== "notion" && source !== "turso") {
+      return Response.json({ error: "Invalid source. Use 'notion' or 'turso'." }, { status: 400 });
+    }
+
+    const result = await runFullSync(source);
     return Response.json({
       success: true,
       ...result,

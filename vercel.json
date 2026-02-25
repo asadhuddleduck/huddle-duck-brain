@@ -1,8 +1,12 @@
 {
   "crons": [
     {
-      "path": "/api/sync",
+      "path": "/api/sync?source=turso",
       "schedule": "0 */4 * * *"
+    },
+    {
+      "path": "/api/sync?source=notion",
+      "schedule": "30 */4 * * *"
     }
   ]
 }

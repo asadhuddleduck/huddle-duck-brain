@@ -5,7 +5,7 @@ import { chunkDocument, hashChunk } from "./chunker";
 import { generateEmbeddings, embeddingToVector } from "./embeddings";
 import type { Document } from "./types";
 
-export async function runFullSync(): Promise<{
+export async function runFullSync(sourceFilter?: "notion" | "turso"): Promise<{
   documentsProcessed: number;
   chunksCreated: number;
   chunksSkipped: number;
@@ -19,29 +19,33 @@ export async function runFullSync(): Promise<{
   let chunksCreated = 0;
   let chunksSkipped = 0;
 
-  // 1. Crawl all sources
-  console.log("Starting full sync...");
+  // 1. Crawl sources (filtered if specified)
+  console.log(`Starting sync${sourceFilter ? ` (${sourceFilter} only)` : ""}...`);
 
   let notionDocs: Document[] = [];
-  try {
-    notionDocs = await crawlNotionWorkspace();
-    await updateSyncStatus("notion", true, notionDocs.length, 0);
-  } catch (error: any) {
-    const msg = `Notion crawl failed: ${error.message}`;
-    console.error(msg);
-    errors.push(msg);
-    await updateSyncStatus("notion", false, 0, 0, msg);
+  if (!sourceFilter || sourceFilter === "notion") {
+    try {
+      notionDocs = await crawlNotionWorkspace();
+      await updateSyncStatus("notion", true, notionDocs.length, 0);
+    } catch (error: any) {
+      const msg = `Notion crawl failed: ${error.message}`;
+      console.error(msg);
+      errors.push(msg);
+      await updateSyncStatus("notion", false, 0, 0, msg);
+    }
   }
 
   let tursoDocs: Document[] = [];
-  try {
-    tursoDocs = await crawlTursoDatabases();
-    await updateSyncStatus("turso", true, tursoDocs.length, 0);
-  } catch (error: any) {
-    const msg = `Turso sync failed: ${error.message}`;
-    console.error(msg);
-    errors.push(msg);
-    await updateSyncStatus("turso", false, 0, 0, msg);
+  if (!sourceFilter || sourceFilter === "turso") {
+    try {
+      tursoDocs = await crawlTursoDatabases();
+      await updateSyncStatus("turso", true, tursoDocs.length, 0);
+    } catch (error: any) {
+      const msg = `Turso sync failed: ${error.message}`;
+      console.error(msg);
+      errors.push(msg);
+      await updateSyncStatus("turso", false, 0, 0, msg);
+    }
   }
 
   const allDocs = [...notionDocs, ...tursoDocs];
