@@ -417,13 +417,14 @@ export async function syncNotionCrawlOnly(): Promise<{
     }
   }
 
-  // Update sync status (only mark successful if not partial)
+  // Update sync status — partial syncs are still successful if they stored docs
+  const hasErrors = errors.length > 0;
   await updateSyncStatus(
     "notion",
-    !partial,
+    !hasErrors,
     documentsStored,
     0, // chunks are created later by /api/embed
-    partial ? "Partial crawl (time budget exceeded)" : undefined
+    partial ? `Partial crawl: ${documentsStored} stored, ${documentsUnchanged} unchanged (time budget exceeded, will continue next run)` : undefined
   );
 
   console.log(

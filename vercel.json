@@ -6,11 +6,11 @@
     },
     {
       "path": "/api/sync?source=notion",
-      "schedule": "30 */4 * * *"
+      "schedule": "30 */1 * * *"
     },
     {
       "path": "/api/embed",
-      "schedule": "45 */4 * * *"
+      "schedule": "45 */1 * * *"
     }
   ]
 }
