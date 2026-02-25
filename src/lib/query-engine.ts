@@ -6,6 +6,8 @@ import {
   VECTOR_OVERSAMPLE_FACTOR,
   KEYWORD_SEARCH_SIMILARITY,
   KEYWORD_FALLBACK_LIMIT,
+  SIMILARITY_WEIGHT,
+  RECENCY_HALF_LIFE_DAYS,
 } from "./constants";
 import type { QueryRequest, QueryResult, QueryResponse, SourceSummary } from "./types";
 import { QueryError } from "./types";
@@ -25,6 +27,32 @@ function safeJsonParse(json: string | null | undefined): Record<string, unknown>
 }
 
 // ---------------------------------------------------------------------------
+// Recency boost — newer documents score higher
+// ---------------------------------------------------------------------------
+// Exponential decay: recency = e^(-age_days / half_life)
+//   - Today: 1.0    - 30 days: 0.72    - 90 days: 0.37
+//   - 180 days: 0.14    - 365 days: 0.02
+// Final score = similarity * SIMILARITY_WEIGHT + recency * (1 - SIMILARITY_WEIGHT)
+// ---------------------------------------------------------------------------
+
+function recencyScore(lastEdited: string | null): number {
+  if (!lastEdited) return 0;
+  try {
+    const editedMs = new Date(lastEdited).getTime();
+    if (isNaN(editedMs)) return 0;
+    const ageDays = Math.max(0, (Date.now() - editedMs) / (1000 * 60 * 60 * 24));
+    return Math.exp(-ageDays / RECENCY_HALF_LIFE_DAYS);
+  } catch {
+    return 0;
+  }
+}
+
+function boostWithRecency(similarity: number, lastEdited: string | null): number {
+  const recency = recencyScore(lastEdited);
+  return similarity * SIMILARITY_WEIGHT + recency * (1 - SIMILARITY_WEIGHT);
+}
+
+// ---------------------------------------------------------------------------
 // Row shapes returned by SQL queries
 // ---------------------------------------------------------------------------
 
@@ -40,6 +68,7 @@ interface VectorSearchRow {
   source_url: string | null;
   doc_type: string;
   doc_metadata: string | null;
+  last_edited: string | null;
 }
 
 interface KeywordSearchRow {
@@ -50,6 +79,7 @@ interface KeywordSearchRow {
   source_url: string | null;
   doc_type: string;
   metadata: string | null;
+  last_edited: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -140,7 +170,8 @@ async function vectorSearch(
   const vecResults = await db.execute({
     sql: `SELECT c.id, vector_distance_cos(c.embedding, vector32(?)) as distance,
                  c.content, c.heading, c.metadata as chunk_metadata,
-                 d.id as doc_id, d.title, d.source, d.source_url, d.doc_type, d.metadata as doc_metadata
+                 d.id as doc_id, d.title, d.source, d.source_url, d.doc_type, d.metadata as doc_metadata,
+                 d.last_edited
           FROM vector_top_k('chunks_vec_idx', vector32(?), ?) AS v
           JOIN chunks c ON c.rowid = v.id
           JOIN documents d ON d.id = c.document_id AND d.source = c.document_source`,
@@ -161,7 +192,8 @@ async function vectorSearch(
   return rows.map((r) => {
     // Turso cosine distance: 0 = identical, 2 = opposite (for cosine metric)
     // Similarity = 1 - distance (clamped to 0-1 range)
-    const similarity = Math.max(0, Math.min(1, 1 - (r.distance ?? 0)));
+    const rawSimilarity = Math.max(0, Math.min(1, 1 - (r.distance ?? 0)));
+    const similarity = boostWithRecency(rawSimilarity, r.last_edited);
 
     return {
       chunk_content: r.content,
@@ -212,10 +244,11 @@ export async function searchByKeyword(
   args.push(safeLimit);
 
   const results = await db.execute({
-    sql: `SELECT c.content, c.heading, d.title, d.source, d.source_url, d.doc_type, d.metadata
+    sql: `SELECT c.content, c.heading, d.title, d.source, d.source_url, d.doc_type, d.metadata, d.last_edited
           FROM chunks c
           JOIN documents d ON d.id = c.document_id AND d.source = c.document_source
           WHERE ${conditions.join(" AND ")}
+          ORDER BY d.last_edited DESC
           LIMIT ?`,
     args,
   });
@@ -229,7 +262,7 @@ export async function searchByKeyword(
       source_url: r.source_url,
       doc_type: r.doc_type,
       heading: r.heading ?? null,
-      similarity: KEYWORD_SEARCH_SIMILARITY,
+      similarity: boostWithRecency(KEYWORD_SEARCH_SIMILARITY, r.last_edited),
       metadata: safeJsonParse(r.metadata),
     };
   });

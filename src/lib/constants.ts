@@ -69,6 +69,14 @@ export const VECTOR_OVERSAMPLE_FACTOR = 2;
 /** Minimum similarity threshold — results below this are filtered out */
 export const MIN_SIMILARITY_THRESHOLD = 0.0;
 
+/** Recency boost: weight given to vector/keyword similarity (remainder goes to recency) */
+export const SIMILARITY_WEIGHT = 0.85;
+
+/** Recency boost: how many days until a document's recency score decays to ~0.
+ *  Uses exponential decay: score = e^(-age_days / HALF_LIFE).
+ *  At HALF_LIFE days the score is ~0.37, at 2x it's ~0.14, at 3x it's ~0.05. */
+export const RECENCY_HALF_LIFE_DAYS = 90;
+
 /** Max keyword search results for fallback when vector search is unavailable */
 export const KEYWORD_FALLBACK_LIMIT = 20;
 
