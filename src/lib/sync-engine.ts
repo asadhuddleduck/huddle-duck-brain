@@ -6,7 +6,131 @@ import { generateEmbeddings, embeddingToVector } from "./embeddings";
 import type { Document } from "./types";
 
 // Max documents to chunk+embed per invocation (avoids 300s timeout)
-const MAX_DOCS_PER_BATCH = 200;
+const MAX_DOCS_PER_BATCH = 50;
+
+// Embed documents that are stored but have no embedded chunks
+export async function embedPending(): Promise<{
+  chunksCreated: number;
+  remaining: number;
+  errors: string[];
+}> {
+  const db = getDb();
+  await initSchema();
+
+  const errors: string[] = [];
+  let chunksCreated = 0;
+
+  // Find documents with no embedded chunks
+  const unembedded = await db.execute({
+    sql: `SELECT d.id, d.source, d.title, d.content
+          FROM documents d
+          WHERE NOT EXISTS (
+            SELECT 1 FROM chunks c
+            WHERE c.document_id = d.id AND c.document_source = d.source AND c.embedding IS NOT NULL
+          )
+          LIMIT ?`,
+    args: [MAX_DOCS_PER_BATCH],
+  });
+
+  const totalUnembedded = await db.execute({
+    sql: `SELECT COUNT(*) as count FROM documents d
+          WHERE NOT EXISTS (
+            SELECT 1 FROM chunks c
+            WHERE c.document_id = d.id AND c.document_source = d.source AND c.embedding IS NOT NULL
+          )`,
+    args: [],
+  });
+
+  const total = totalUnembedded.rows[0]?.count as number;
+  const rows = unembedded.rows;
+
+  if (rows.length === 0) {
+    return { chunksCreated: 0, remaining: 0, errors: [] };
+  }
+
+  console.log(`Embedding ${rows.length} of ${total} unembedded documents...`);
+
+  // Chunk all documents
+  const allChunks: Array<{
+    documentId: string;
+    documentSource: string;
+    index: number;
+    content: string;
+    heading: string | null;
+    metadata: string;
+  }> = [];
+
+  for (const row of rows) {
+    const docId = row.id as string;
+    const docSource = row.source as string;
+    const title = row.title as string;
+    const content = row.content as string;
+
+    // Delete old chunks
+    await db.execute({
+      sql: "DELETE FROM chunks WHERE document_id = ? AND document_source = ?",
+      args: [docId, docSource],
+    });
+
+    const chunks = chunkDocument(content, title);
+    for (const chunk of chunks) {
+      allChunks.push({
+        documentId: docId,
+        documentSource: docSource,
+        index: chunk.index,
+        content: chunk.content,
+        heading: chunk.heading,
+        metadata: JSON.stringify(chunk.metadata),
+      });
+    }
+  }
+
+  console.log(`Generated ${allChunks.length} chunks`);
+
+  // Generate embeddings
+  const chunkTexts = allChunks.map((c) => c.content);
+  let embeddings: number[][];
+
+  try {
+    embeddings = await generateEmbeddings(chunkTexts, "document");
+  } catch (error: any) {
+    const msg = `Embedding failed: ${error.message}`;
+    console.error(msg);
+    errors.push(msg);
+    return { chunksCreated, remaining: total, errors };
+  }
+
+  // Store chunks
+  for (let i = 0; i < allChunks.length; i++) {
+    const chunk = allChunks[i];
+    const embedding = embeddings[i];
+
+    try {
+      await db.execute({
+        sql: `INSERT INTO chunks (document_id, document_source, chunk_index, content, content_hash, heading, metadata, embedding)
+              VALUES (?, ?, ?, ?, ?, ?, ?, vector32(?))
+              ON CONFLICT(document_source, document_id, chunk_index) DO UPDATE SET
+                content = excluded.content,
+                content_hash = excluded.content_hash,
+                heading = excluded.heading,
+                metadata = excluded.metadata,
+                embedding = excluded.embedding`,
+        args: [
+          chunk.documentId, chunk.documentSource, chunk.index,
+          chunk.content, hashChunk(chunk.content), chunk.heading,
+          chunk.metadata, embeddingToVector(embedding),
+        ],
+      });
+      chunksCreated++;
+    } catch (error: any) {
+      errors.push(`Chunk store failed: ${error.message}`);
+    }
+  }
+
+  const remaining = total - rows.length;
+  console.log(`Embedded ${chunksCreated} chunks, ${remaining} documents remaining`);
+  return { chunksCreated, remaining, errors };
+}
 
 export async function runFullSync(sourceFilter?: "notion" | "turso"): Promise<{
   documentsProcessed: number;
