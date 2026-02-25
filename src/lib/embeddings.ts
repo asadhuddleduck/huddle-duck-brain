@@ -85,9 +85,36 @@ export async function generateEmbeddings(
   return allEmbeddings;
 }
 
+/**
+ * Generate a single query embedding.
+ * Does NOT retry on failure — if Voyage is down, throws EmbeddingServiceError
+ * so the query engine can fall back to keyword search immediately rather than
+ * hanging the serverless function with exponential backoff.
+ */
 export async function generateQueryEmbedding(query: string): Promise<number[]> {
-  const embeddings = await generateEmbeddings([query], "query");
-  return embeddings[0];
+  const apiKey = process.env.VOYAGE_API_KEY?.trim();
+  if (!apiKey) throw new EmbeddingServiceError("VOYAGE_API_KEY is not set");
+
+  const res = await fetch(VOYAGE_API_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      input: [query],
+      model: VOYAGE_MODEL,
+      input_type: "query",
+      output_dimension: EMBEDDING_DIMENSIONS,
+    }),
+  });
+
+  if (!res.ok) {
+    throw new EmbeddingServiceError(`Voyage API error: ${res.status}`, res.status);
+  }
+
+  const data = (await res.json()) as VoyageResponse;
+  return data.data[0].embedding;
 }
 
 /** Convert embedding array to Turso vector format string */

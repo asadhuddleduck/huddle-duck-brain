@@ -166,7 +166,7 @@ export async function searchByKeyword(
     .replace(/_/g, "\\_");
 
   // Build WHERE clause
-  const conditions: string[] = ["c.content LIKE ? ESCAPE '\\\\'"];
+  const conditions: string[] = ["c.content LIKE ? ESCAPE '\\'"];
   const args: Value[] = [`%${escapedKeyword}%`];
 
   if (source) {
