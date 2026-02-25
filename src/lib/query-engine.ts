@@ -107,12 +107,13 @@ async function vectorSearch(
     : topK * VECTOR_OVERSAMPLE_FACTOR;
 
   const vecResults = await db.execute({
-    sql: `SELECT c.id, v.distance, c.content, c.heading, c.metadata as chunk_metadata,
+    sql: `SELECT c.id, vector_distance_cos(c.embedding, vector32(?)) as distance,
+                 c.content, c.heading, c.metadata as chunk_metadata,
                  d.id as doc_id, d.title, d.source, d.source_url, d.doc_type, d.metadata as doc_metadata
           FROM vector_top_k('chunks_vec_idx', vector32(?), ?) AS v
           JOIN chunks c ON c.rowid = v.id
           JOIN documents d ON d.id = c.document_id AND d.source = c.document_source`,
-    args: [vectorStr, fetchCount],
+    args: [vectorStr, vectorStr, fetchCount],
   });
 
   // Post-query filtering: apply source/docType filters in application code
