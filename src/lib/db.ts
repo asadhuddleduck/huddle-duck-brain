@@ -1,3 +1,4 @@
+import { databaseFetch } from "./database-fetch";
 import { createClient, type Client } from "@libsql/client";
 import { SYNC_LOCK_TIMEOUT_SECONDS } from "./constants";
 import type { HealthStatus } from "./types";
@@ -30,7 +31,7 @@ export function getDb(): Client {
     const authToken = process.env.TURSO_AUTH_TOKEN?.trim();
     if (!url) throw new Error("TURSO_DATABASE_URL is not set");
     if (!authToken) throw new Error("TURSO_AUTH_TOKEN is not set");
-    _db = createClient({ url, authToken });
+    _db = createClient({ url, authToken, fetch: databaseFetch });
   }
   return _db;
 }

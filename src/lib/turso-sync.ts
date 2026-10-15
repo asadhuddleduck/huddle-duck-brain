@@ -1,3 +1,4 @@
+import { databaseFetch } from "./database-fetch";
 // src/lib/turso-sync.ts
 import { createClient, type Client } from "@libsql/client";
 import { hashContent } from "./hash";
@@ -128,7 +129,7 @@ function connectToSource(source: TursoSource): Client | null {
     console.warn(`[turso-sync] Skipping ${source.name}: missing env vars`);
     return null;
   }
-  return createClient({ url, authToken: token });
+  return createClient({ url, authToken: token, fetch: databaseFetch });
 }
 
 function rowToContent(row: Record<string, unknown>, contentColumns: string[]): string {
