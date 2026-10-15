@@ -2,6 +2,21 @@
 export const DATABASE_CLEANUP_MS = 5_000;
 const cleanupDeadlines = new Map<string, number>();
 
+function boundedSignal(upstream?: AbortSignal): { signal: AbortSignal; dispose: () => void } {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(new Error("Database request timed out")), 10_000);
+  const abortFromUpstream = () => controller.abort(upstream?.reason);
+  if (upstream?.aborted) abortFromUpstream();
+  else upstream?.addEventListener("abort", abortFromUpstream, { once: true });
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      clearTimeout(timeout);
+      upstream?.removeEventListener("abort", abortFromUpstream);
+    },
+  };
+}
+
 // Hrana v2 sends rollback and stream close in one pipeline. Inspect the whole
 // wire request: a mixed batch, cached SQL or a commit never earns extra time.
 export function cleanupOnly(body: string): boolean {
@@ -42,16 +57,20 @@ export async function databaseFetch(input: Request): Promise<Response> {
       }
     } catch { /* Preserve the original uncertain outcome. */ }
   };
+  const bounded = boundedSignal(input.signal);
   try {
-    const response=await globalThis.fetch(input.url, { ...init, signal: AbortSignal.any([input.signal, AbortSignal.timeout(10_000)]) });
-    if(!response.body)return response;
+    const response=await globalThis.fetch(input.url, { ...init, signal: bounded.signal });
+    if(!response.body) {
+      bounded.dispose();
+      return response;
+    }
     const reader=response.body.getReader();
     return new Response(new ReadableStream<Uint8Array>({
       async pull(controller){
-        try {const next=await reader.read();if(next.done)controller.close();else controller.enqueue(next.value);}
-        catch(error){await closeUncertainStream();controller.error(error);}
+        try {const next=await reader.read();if(next.done){bounded.dispose();controller.close();}else controller.enqueue(next.value);}
+        catch(error){bounded.dispose();await closeUncertainStream();controller.error(error);}
       },
-      async cancel(reason){await reader.cancel(reason);await closeUncertainStream();},
+      async cancel(reason){await reader.cancel(reason);bounded.dispose();await closeUncertainStream();},
     }),{status:response.status,statusText:response.statusText,headers:response.headers});
-  } catch(error) {await closeUncertainStream();throw error;}
+  } catch(error) {bounded.dispose();await closeUncertainStream();throw error;}
 }
